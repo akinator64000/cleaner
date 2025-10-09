@@ -13,9 +13,12 @@ import { PublicKey } from '@solana/web3.js'
 import React, { useCallback, useMemo, useState } from 'react'
 import { View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
+import { useConnection } from '@/components/solana/solana-provider'
+import { useNftEnrichment } from '@/hooks/use-nft-enrichment'
 
 export default function NftsScreen() {
   const { account } = useWalletUi()
+  const connection = useConnection()
   const { data, isLoading, isError, refetch } = useHeliusAssets(account?.publicKey!)
   const [selectedTab, setSelectedTab] = useState<'nft' | 'cnft'>('nft')
   const [selectedIds, setSelectedIds] = useState<string[]>([])
@@ -24,7 +27,10 @@ export default function NftsScreen() {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const insets = useSafeAreaInsets()
 
-  const all = useMemo(() => parseHeliusNFTs(data?.nfts ?? []), [data?.nfts])
+  const rawNfts = data?.nfts ?? []
+  const { nfts: enrichedNfts } = useNftEnrichment(connection, rawNfts)
+
+  const all = useMemo(() => parseHeliusNFTs(enrichedNfts), [enrichedNfts])
   const nfts = useMemo(() => all.filter(n => !n.isCompressed), [all])
   const cnfts = useMemo(() => all.filter(n => n.isCompressed), [all])
 
