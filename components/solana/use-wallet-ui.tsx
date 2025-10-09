@@ -1,4 +1,4 @@
-// hooks/use-wallet-ui.ts
+// components/solana/use-wallet-ui.ts
 import { useAuthorization } from '@/components/solana/use-authorization'
 import { useMobileWallet } from '@/components/solana/use-mobile-wallet'
 import { useCallback } from 'react'

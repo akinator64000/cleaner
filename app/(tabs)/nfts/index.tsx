@@ -22,9 +22,9 @@ export default function NftsScreen() {
   const { data, isLoading, isError, refetch } = useHeliusAssets(account?.publicKey!)
   const [selectedTab, setSelectedTab] = useState<'nft' | 'cnft'>('nft')
   const [selectedIds, setSelectedIds] = useState<string[]>([])
-  const { mutateAsync: burnNfts } = useBurnNfts()
   const [busy, setBusy] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const { mutateAsync: burnNfts } = useBurnNfts()
   const insets = useSafeAreaInsets()
 
   const rawNfts = data?.nfts ?? []

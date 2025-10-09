@@ -100,7 +100,7 @@ const PRIORITY_FEE_MICRO_LAMPORTS = 20_000 // ajuste si réseau chargé
 
 // ---------------------------------------------------------------------------
 
-export function useBurnNfts() {
+export function useBurnNfts({ deepClean = true }: { deepClean?: boolean } = {}) {
   const { account, signAndSendTransaction } = useWalletUi()
   const connection = useConnection()
 
@@ -270,6 +270,65 @@ export function useBurnNfts() {
     [umi],
   )
 
+  // ---------- legacy TM NFT (non-pNFT) ---------------------------------------
+  const buildLegacyTmBurn = useCallback(
+    async ({
+      owner,
+      mint,
+      tokenAccount,
+      tokenProgramId,
+    }: {
+      owner: PublicKey
+      mint: PublicKey
+      tokenAccount: PublicKey
+      tokenProgramId: PublicKey
+    }): Promise<TransactionInstruction[] | null> => {
+      try {
+        const mintU = umiPk(mint.toBase58())
+        const ownerU = umiPk(owner.toBase58())
+        const tokenU = umiPk(tokenAccount.toBase58())
+
+        // ✅ important : signer UMI
+        umi.use(signerIdentity(createNoopSigner(ownerU)))
+
+        // Vérifie présence du Metadata PDA (sinon -> pas TM)
+        const mdPda = findMetadataPda(umi, { mint: mintU })
+        const mdAi = await connection.getAccountInfo(new PublicKey(mdPda[0]), { commitment: 'processed' })
+        if (!mdAi) return null
+
+        // MasterEdition optionnel
+        const mePda = findMasterEditionPda(umi, { mint: mintU })
+        const meAi = await connection.getAccountInfo(new PublicKey(mePda[0]), { commitment: 'processed' })
+        const hasME = !!meAi
+
+        const maybeSplTokenProgram = tokenProgramId.equals(TOKEN_2022_PROGRAM_ID)
+          ? { splTokenProgram: umiPk(TOKEN_2022_PROGRAM_ID.toBase58()) }
+          : {}
+
+        // Burn TM "legacy" (pas de tokenRecord ni rules)
+        const burn = burnV1(umi, {
+          mint: mintU,
+          tokenOwner: ownerU,
+          token: tokenU,
+          metadata: mdPda,
+          ...(hasME ? { edition: mePda } : {}),
+          authority: createNoopSigner(ownerU),
+          burnArgs: { amount: 1n, authorizationData: null },
+          ...maybeSplTokenProgram,
+        } as any)
+
+        const ixs = ((burn as any).items as { instruction: any }[]).map((it) => toWeb3JsInstruction(it.instruction))
+
+        // Close ATA
+        ixs.push(createCloseAccountInstruction(tokenAccount, owner, owner, [], tokenProgramId))
+        return ixs
+      } catch {
+        return null
+      }
+    },
+    [umi, connection],
+  )
+
   // ---------- final sending -------------------------------------------------
 
   const sendGroups = useCallback(
@@ -406,18 +465,16 @@ export function useBurnNfts() {
           }
 
           let pnftIxs: TransactionInstruction[] | null = null
-          if (it.isPnftHint) {
+          {
+            // Essaie pNFT même sans hint (buildPnftVariants retourne null si pas pNFT)
             const variants = await buildPnftVariants(owner, it.mint, tokenAccount!, it.collectionMintHint)
             if (variants) {
-              // ---- Essaye d’abord BURN ONLY (with rules → no rules)
               const order = [
                 { name: 'burn only (with rules)', ixs: variants.burnOnlyWithRules },
                 { name: 'burn only (no rules)', ixs: variants.burnOnly },
                 { name: 'unlock+burn (with rules)', ixs: variants.unlockThenBurnWithRules },
                 { name: 'unlock+burn (no rules)', ixs: variants.unlockThenBurn },
               ]
-
-              let lastErr: any = null
               for (const cand of order) {
                 if (!cand.ixs || cand.ixs.length === 0) continue
                 const sim = await simulateIxs(
@@ -433,15 +490,7 @@ export function useBurnNfts() {
                   pnftIxs = cand.ixs
                   break
                 }
-                lastErr = sim.err
-                // Si c’est un chemin "unlock" et qu’on voit 0x9e (InvalidAuthorityType), évite les autres "unlock"
-                if (/\"Custom\"\s*:\s*158/.test(JSON.stringify(lastErr)) && cand.name.startsWith('unlock')) {
-                  // on a déjà tenté burn-only en premier; on n’insiste pas sur unlock
-                  break
-                }
               }
-
-              // fallback: même si la simu a échoué, on envoie le meilleur candidat burn-only
               if (!pnftIxs) {
                 pnftIxs =
                   variants.burnOnlyWithRules ??
@@ -449,18 +498,58 @@ export function useBurnNfts() {
                   variants.unlockThenBurnWithRules ??
                   variants.unlockThenBurn
               }
-
-              if (!pnftIxs || pnftIxs.length === 0) {
-                skipped.push({ mint: mint58, reason: 'pNFT: no viable instructions' })
-                continue
-              }
             }
           }
 
-          if (pnftIxs) {
+          if (deepClean && pnftIxs) {
             prepared.push({ mint: it.mint, ixs: [...pnftIxs], kind: 'pnft' })
+          } else if (deepClean) {
+            // ✱ Tentative "legacy TM" d’abord (refund max ~0.007)
+            const legacyIxs = await buildLegacyTmBurn({
+              owner,
+              mint: it.mint,
+              tokenAccount: tokenAccount!,
+              tokenProgramId: programId,
+            })
+
+            if (legacyIxs) {
+              // Simule le chemin "legacy TM" avant d'empiler
+              const sim = await simulateIxs(
+                owner,
+                [
+                  ComputeBudgetProgram.setComputeUnitLimit({ units: CB_UNITS }),
+                  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE_MICRO_LAMPORTS }),
+                  ...legacyIxs,
+                ],
+                'legacy-tm-check',
+              )
+
+              if (sim.ok) {
+                prepared.push({ mint: it.mint, kind: 'spl', ixs: legacyIxs })
+              } else {
+                // fallback SPL pur si la simu échoue
+                prepared.push({
+                  mint: it.mint,
+                  kind: 'spl',
+                  ixs: [
+                    createBurnInstruction(tokenAccount!, it.mint, owner, 1n, [], programId),
+                    createCloseAccountInstruction(tokenAccount!, owner, owner, [], programId),
+                  ],
+                })
+              }
+            } else {
+              // pas de compte Metadata → SPL pur
+              prepared.push({
+                mint: it.mint,
+                kind: 'spl',
+                ixs: [
+                  createBurnInstruction(tokenAccount!, it.mint, owner, 1n, [], programId),
+                  createCloseAccountInstruction(tokenAccount!, owner, owner, [], programId),
+                ],
+              })
+            }
           } else {
-            // Standard SPL / Token-2022
+            // deepClean désactivé → SPL pur (simple et rapide)
             prepared.push({
               mint: it.mint,
               kind: 'spl',
@@ -506,8 +595,10 @@ export function useBurnNfts() {
       resolveAtaByMintProgram,
       buildPnftVariants,
       buildCoreBurnVariants,
+      buildLegacyTmBurn,
       sendGroups,
       simulateIxs,
+      deepClean,
     ],
   )
 
